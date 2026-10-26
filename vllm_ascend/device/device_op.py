@@ -890,33 +890,26 @@ class BaseDeviceAdaptor:
         fused_fwd,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the A2/A3 Phase6 FLA NPU GDN prefill kernel."""
-        # FLA's import-time capability queries can initialize an NPU context;
-        # defer them until execution on the selected worker device.
-        # TODO: Restore the top-level import once supported vLLM FLA or Triton
-        # Ascend versions make these queries safe before device selection.
-        from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
+        # Keep Triton imports lazy until the worker selects its device.
+        from vllm_ascend.ops.triton.fla.l2norm import l2norm_fwd_head_first
 
-        q = l2norm_fwd(q.contiguous()).contiguous()
-        k = l2norm_fwd(k.contiguous()).contiguous()
-        v = v.contiguous()
+        # Fuse normalization and BSND -> BNSD packing. In particular, head-first
+        # views must not be copied to sequence-major and then copied back.
+        q = l2norm_fwd_head_first(q)
+        k = l2norm_fwd_head_first(k)
+        v = v.transpose(1, 2).contiguous()
         g = g.to(torch.float32).contiguous()
         beta = beta.to(v.dtype).contiguous()
-        initial_state = initial_state.contiguous()
-
-        # BNSD/NTD take [B, H, T, D]; q/k/v arrive sequence-major. The output is
-        # still returned sequence-major, so only the inputs are permuted.
-        q = q.transpose(1, 2).contiguous()
-        k = k.transpose(1, 2).contiguous()
-        v = v.transpose(1, 2).contiguous()
 
         cu_seqlens = prebuilt_meta.cu_seqlens_host
         chunk_indices = prebuilt_meta.chunk_indices_chunk64_host
         keep_meta = prebuilt_meta.keep_meta
         # stateVFirst=false takes [N, Hv, K, V], i.e. the transpose of ssm_state.
-        initial_state_kern = initial_state.transpose(-1, -2).contiguous()
         if keep_meta is not None:
             cu_seqlens = prebuilt_meta.cu_seqlens_kern
             initial_state_kern = initial_state[keep_meta].transpose(-1, -2).contiguous()
+        else:
+            initial_state_kern = initial_state.transpose(-1, -2).contiguous()
 
         output, final_state, *_ = fused_fwd(
             q,
