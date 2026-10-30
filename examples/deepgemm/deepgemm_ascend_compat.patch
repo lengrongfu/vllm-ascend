@@ -1,0 +1,337 @@
+diff --git a/csrc/apis/mega_moe.hpp b/csrc/apis/mega_moe.hpp
+index f74fe19..9f3acfb 100644
+--- a/csrc/apis/mega_moe.hpp
++++ b/csrc/apis/mega_moe.hpp
+@@ -140,7 +140,9 @@ static void fp8_fp4_mega_moe(
+     const std::tuple<int, int, int>& recipe,
+     const std::string& activation,
+     const std::optional<float>& activation_clamp_opt,
+-    const bool& fast_math
++    const bool& fast_math,
++    const bool& apply_router_weight_on_output,
++    const bool& use_cann_mxfp_quant
+ ) {
+     // Config checks
+     const auto [rm, rn, rk] = recipe;
+@@ -200,6 +202,8 @@ static void fp8_fp4_mega_moe(
+         .rank_idx = static_cast<uint32_t>(rank_idx),
+         .num_tokens = num_tokens,
+         .activation_clamp = static_cast<float>(c10::BFloat16(activation_clamp)),
++        .apply_router_weight_on_output = apply_router_weight_on_output,
++        .use_cann_mxfp_quant = use_cann_mxfp_quant,
+     });
+ }
+ 
+@@ -221,7 +225,8 @@ static void register_apis(py::module_& m) {
+           py::arg("sym_buffer_ptrs"), py::arg("rank_idx"), py::arg("num_max_tokens_per_rank"),
+           py::arg("num_experts"), py::arg("num_topk"), py::arg("hidden"),
+           py::arg("intermediate_hidden"), py::arg("num_shared_experts"), py::arg("recipe"),
+-          py::arg("activation"), py::arg("activation_clamp_opt"), py::arg("fast_math"));
++          py::arg("activation"), py::arg("activation_clamp_opt"), py::arg("fast_math"),
++          py::arg("apply_router_weight_on_output") = false, py::arg("use_cann_mxfp_quant") = false);
+ }
+ 
+ } // namespace deep_gemm::mega_moe
+diff --git a/csrc/backends/hccl.hpp b/csrc/backends/hccl.hpp
+index 71c188b..cba81a5 100644
+--- a/csrc/backends/hccl.hpp
++++ b/csrc/backends/hccl.hpp
+@@ -118,8 +118,10 @@ private:
+         uint32_t* layers = nullptr;
+         uint32_t num_layers = 0;
+         DG_HCCL_CHECK(HcclRankGraphGetLayers(comm, &layers, &num_layers));
+-        DJ_HOST_ASSERT(num_layers > 1, "UBMEM requires network layer 1; got {} layers", num_layers);
+-        const uint32_t layer = layers[1];
++        DJ_HOST_ASSERT(num_layers > 0, "UBMEM requires a network layer; got {} layers", num_layers);
++        // Single-server CANN 9.2 topologies expose UB_MEM on the only layer.
++        // make_peer_descriptor still verifies every peer has a UB_MEM link.
++        const uint32_t layer = layers[num_layers > 1 ? 1 : 0];
+ 
+         std::vector<HcclChannelDesc> descriptors;
+         descriptors.reserve(num_ranks - 1);
+diff --git a/csrc/jit_kernels/mega_moe.hpp b/csrc/jit_kernels/mega_moe.hpp
+index f516422..895fb36 100644
+--- a/csrc/jit_kernels/mega_moe.hpp
++++ b/csrc/jit_kernels/mega_moe.hpp
+@@ -19,12 +19,16 @@ struct MegaMoEArgs {
+     uint32_t rank_idx;
+     uint32_t num_tokens;
+     float activation_clamp;
++    bool apply_router_weight_on_output;
++    bool use_cann_mxfp_quant;
+ };
+ 
+ static void launch_mega_moe(const MegaMoEArgs& args) {
+     const auto& workspace = args.workspace;
+     const auto& config = workspace.config;
+     const auto code = std::format(R"(
++#define DG_MOE_ROUTER_WEIGHT_ON_OUTPUT {}
++#define DG_MOE_CANN_MXFP_QUANT {}
+ #include <deep_gemm/mega_moe.hpp>
+ 
+ static void __instantiate() {{
+@@ -32,6 +36,7 @@ static void __instantiate() {{
+ }}
+ 
+ )",
++        static_cast<int>(args.apply_router_weight_on_output), static_cast<int>(args.use_cann_mxfp_quant),
+         config.num_ranks, config.num_experts, config.num_shared_experts, config.num_max_tokens_per_rank,
+         config.num_topk, config.hidden, config.intermediate_hidden);
+     if (runtime->get_dry_run()) {
+diff --git a/deep_gemm/__init__.py b/deep_gemm/__init__.py
+index 7d202ea..a71582a 100644
+--- a/deep_gemm/__init__.py
++++ b/deep_gemm/__init__.py
+@@ -154,6 +154,8 @@ from .locality_domain import (
+ )
+ 
+ # TileLang kernel implementations
+-from .tilelang_ops import tf32_hc_prenorm_gemm
++def tf32_hc_prenorm_gemm(*args, **kwargs):
++    from .tilelang_ops import tf32_hc_prenorm_gemm as impl
++    return impl(*args, **kwargs)
+ 
+ _C.init(__version__, get_library_root_path())
+diff --git a/deep_gemm/include/deep_gemm/comm/mega_moe.hpp b/deep_gemm/include/deep_gemm/comm/mega_moe.hpp
+index adb8aff..51278a2 100644
+--- a/deep_gemm/include/deep_gemm/comm/mega_moe.hpp
++++ b/deep_gemm/include/deep_gemm/comm/mega_moe.hpp
+@@ -1,4 +1,6 @@
+ #pragma once
++#include <utils/debug/asc_printf.h>
++#include <utils/debug/asc_assert.h>
+ 
+ #include <deep_gemm/ascend.hpp>
+ #include <deep_gemm/layout/mega_moe.hpp>
+@@ -55,7 +57,7 @@ __simt_callee__ __forceinline__ void grid_sync(__gm__ uint32_t* counter_ptr, uin
+                 const uint32_t current = *reinterpret_cast<volatile __gm__ uint32_t*>(counter_ptr);
+                 __asc_simt_vf::printf("MegaMoE grid sync timeout: rank=%u worker=%u grid=%u workers=%u current=0x%x expected_tag=0x%x\n",
+                                      rank_idx, worker_idx, kGridSyncIdx, num_workers, current, expected_tag);
+-                __trap();
++                __asc_simt_vf::__trap();
+             }
+         }
+     }
+diff --git a/deep_gemm/include/deep_gemm/common.hpp b/deep_gemm/include/deep_gemm/common.hpp
+index 8c638ca..2476d93 100644
+--- a/deep_gemm/include/deep_gemm/common.hpp
++++ b/deep_gemm/include/deep_gemm/common.hpp
+@@ -15,7 +15,7 @@
+ // from host translation units. Keep it dependency-free.
+ 
+ #include <cstdint>
+-#include <utility>
++#include <type_traits>
+ 
+ // The device compiler (bisheng) defines __CCE__ and provides __aicore__ / __gm__. On the
+ // host these are not keywords, so define them away — this lets a handful of small types
+diff --git a/deep_gemm/include/deep_gemm/mega_moe.hpp b/deep_gemm/include/deep_gemm/mega_moe.hpp
+index 5299e05..27a4862 100644
+--- a/deep_gemm/include/deep_gemm/mega_moe.hpp
++++ b/deep_gemm/include/deep_gemm/mega_moe.hpp
+@@ -1,5 +1,9 @@
+ #pragma once
+ 
++#ifndef DG_MOE_ROUTER_WEIGHT_ON_OUTPUT
++#define DG_MOE_ROUTER_WEIGHT_ON_OUTPUT 0
++#endif
++
+ #include <deep_gemm/ascend.hpp>
+ #include <deep_gemm/comm/mega_moe.hpp>
+ #include <deep_gemm/layout/mega_moe.hpp>
+@@ -130,7 +134,11 @@ __aicore__ constexpr auto make_reduce_buffer(uint32_t addr = 0) {
+     constexpr auto& config = workspace.config;
+     constexpr uint32_t kNumInputs = config.num_topk + (config.num_shared_experts > 0);
+     constexpr uint32_t kNumChannelsPerVector = sizeof(vector_bfloat16_t) / sizeof(bfloat16_t);
+-    const uint32_t num_channels = (UBSizeBytes - addr) / (kNumReduceStages * kNumInputs * sizeof(bfloat16_t)) /
++    // Reserve one 32-byte DMA slot per route and stage for output weighting.
++    constexpr uint32_t kWeightBytes = DG_MOE_ROUTER_WEIGHT_ON_OUTPUT ? kNumReduceStages * kNumInputs * 32 : 0;
++    if (addr + kWeightBytes >= UBSizeBytes)
++        return ub_ptr<bfloat16_t>(kNumInputs, 0, addr);
++    const uint32_t num_channels = (UBSizeBytes - addr - kWeightBytes) / (kNumReduceStages * kNumInputs * sizeof(bfloat16_t)) /
+         kNumChannelsPerVector * kNumChannelsPerVector;
+     return ub_ptr<bfloat16_t>(kNumInputs, config.hidden < num_channels ? config.hidden : num_channels, addr);
+ }
+@@ -147,6 +155,8 @@ __aicore__ inline bool advance_combine_reduce(__gm__ uint8_t* buffer, __gm__ bfl
+ 
+     const uint32_t num_chunk_channels = ub_reduce_inputs.shape_n;
+ 
++    constexpr uint32_t kNumInputs = config.num_topk + kHasSharedExperts;
++    constexpr ub_ptr<float> ub_reduce_weights(1, kNumInputs * 8, UBSizeBytes - kNumReduceStages * kNumInputs * 32);
+     const auto combine_input = workspace.combine_input.get_ptr(buffer);
+     const auto topk_idx = workspace.input.topk_idx.template get_ptr<uint64_t>(buffer);
+     auto& stage_idx = state.stage_idx;
+@@ -208,11 +218,21 @@ __aicore__ inline bool advance_combine_reduce(__gm__ uint8_t* buffer, __gm__ bfl
+ 
+             // Pack valid routes, then shared output; keep the reserved stage stride
+             uint32_t num_inputs = 0;
++            uint32_t num_routed_inputs = 0;
+             for (uint32_t topk_slot_idx = 0; topk_slot_idx < config.num_topk + kHasSharedExperts; ++ topk_slot_idx) {
+                 if (topk_slot_idx < config.num_topk and (kOverlapReduce ? (state.valid_topk_mask & (1u << topk_slot_idx)) == 0 :
+                         asc_load_dev(topk_idx + static_cast<uint64_t>(token_idx) * config.num_topk + topk_slot_idx) >= config.num_experts))
+                     continue;
+                 const auto src = combine_input + workspace.get_combine_m_idx(topk_slot_idx, token_idx) * config.hidden + channel_base;
++                if constexpr (DG_MOE_ROUTER_WEIGHT_ON_OUTPUT) {
++                    if (topk_slot_idx < config.num_topk) {
++                        const auto weight = workspace.input.topk_weights.get_ptr(buffer,
++                            static_cast<uint64_t>(token_idx) * config.num_topk + topk_slot_idx);
++                        copy_gm_to_ub(ub_reduce_weights[stage_idx].ptr() + num_inputs * 8,
++                            weight, 1, 1, sizeof(float), asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM);
++                        ++num_routed_inputs;
++                    }
++                }
+                 copy_gm_to_ub(ub_reduce_inputs[stage_idx].ptr() + num_inputs++ * num_channels,
+                               src, 1, num_channels, num_channels * sizeof(bfloat16_t), asc_load_l2_cache_mode::NOTALLOC_KEEP);
+             }
+@@ -220,7 +240,8 @@ __aicore__ inline bool advance_combine_reduce(__gm__ uint8_t* buffer, __gm__ bfl
+ 
+             // Accumulate in FP32, then round once to BF16
+             wait<PIPE_MTE2, PIPE_V>(kReduceFull, stage_idx);
+-            vf_combine_reduce(ub_reduce_inputs[stage_idx].ptr(), num_inputs, num_channels);
++            vf_combine_reduce<DG_MOE_ROUTER_WEIGHT_ON_OUTPUT>(ub_reduce_inputs[stage_idx].ptr(), num_inputs,
++                num_channels, ub_reduce_weights[stage_idx].ptr(), num_routed_inputs);
+             notify<PIPE_V, PIPE_MTE3>(kReduceOutputFull, stage_idx);
+ 
+             // Store BF16 output
+@@ -942,7 +963,7 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
+             if (is_shared) {
+                 vf_swiglu_quant<false, STORE_BLOCK_M>(input, output, output_sf, nullptr, step_m, activation_clamp);
+             } else {
+-                vf_swiglu_quant<true, STORE_BLOCK_M>(input, output, output_sf, ub_route_weights.ptr() + m_idx_in_stage, step_m, activation_clamp);
++                vf_swiglu_quant<!DG_MOE_ROUTER_WEIGHT_ON_OUTPUT, STORE_BLOCK_M>(input, output, output_sf, ub_route_weights.ptr() + m_idx_in_stage, step_m, activation_clamp);
+             }
+             epi.m_idx_in_block += step_m;
+ 
+diff --git a/deep_gemm/include/deep_gemm/simd/mega_moe.hpp b/deep_gemm/include/deep_gemm/simd/mega_moe.hpp
+index 3d567e6..c16e035 100644
+--- a/deep_gemm/include/deep_gemm/simd/mega_moe.hpp
++++ b/deep_gemm/include/deep_gemm/simd/mega_moe.hpp
+@@ -1,5 +1,9 @@
+ #pragma once
+ 
++#ifndef DG_MOE_CANN_MXFP_QUANT
++#define DG_MOE_CANN_MXFP_QUANT 0
++#endif
++
+ #include <deep_gemm/ascend.hpp>
+ #include <deep_gemm/layout/mega_moe.hpp>
+ 
+@@ -121,6 +125,24 @@ __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ flo
+                 asc_mul(value[pair_idx], value[pair_idx], route_weight[pair_idx / kNumPairsPerRow], pair_mask_b32);
+         }
+ 
++        if constexpr (DG_MOE_CANN_MXFP_QUANT) {
++            // CANN SwigluGroupQuant materializes BF16 before MX quantization.
++            // IEEE round-to-nearest-even on finite FP32 activation values.
++            vector_uint32_t one, bf16_mask;
++            asc_duplicate_scalar(one, 1u);
++            asc_duplicate_scalar(bf16_mask, 0xffff0000u);
++            #pragma unroll
++            for (uint32_t pair_idx = 0; pair_idx < kNumPairs; ++pair_idx) {
++                auto& bits = reinterpret_cast<vector_uint32_t&>(value[pair_idx]);
++                vector_uint32_t bias;
++                asc_shiftright_scalar(bias, bits, 16, pair_mask_b32);
++                asc_and(bias, bias, one, pair_mask_b32);
++                asc_add_scalar(bias, bias, 0x7fffu, pair_mask_b32);
++                asc_add(bits, bits, bias, pair_mask_b32);
++                asc_and(bits, bits, bf16_mask, pair_mask_b32);
++            }
++        }
++
+         // Reduce amax for both 32-channel groups in each SF pair
+         #pragma unroll
+         for (uint32_t pair_idx = 0; pair_idx < kNumPairs; ++ pair_idx) {
+@@ -137,8 +159,13 @@ __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ flo
+ 
+             // Round amax / 448 up to a power of two
+             asc_select(bits[0], bits[0], bits[1], group_mask_b32);
+-            asc_max_scalar(bits[0], bits[0], 0x38d1b717u, pair_mask_b32);  // FP32 bits of 1e-4
+-            asc_add_scalar(bits[0], bits[0], 0x001fffffu, pair_mask_b32);  // Carry when significand > 1.75
++            if constexpr (DG_MOE_CANN_MXFP_QUANT) {
++                // CANN uses floor(log2(amax)) - 8, with FP8 saturation.
++                asc_max_scalar(bits[0], bits[0], 0x04000000u, pair_mask_b32);
++            } else {
++                asc_max_scalar(bits[0], bits[0], 0x38d1b717u, pair_mask_b32);  // FP32 bits of 1e-4
++                asc_add_scalar(bits[0], bits[0], 0x001fffffu, pair_mask_b32);  // Carry when significand > 1.75
++            }
+             asc_and(bits[0], bits[0], exponent_mask, pair_mask_b32);
+             asc_add_scalar(reinterpret_cast<vector_int32_t&>(bits[0]),
+                            reinterpret_cast<vector_int32_t&>(bits[0]), -0x04000000, pair_mask_b32);  // Subtract 8 from exponent
+@@ -147,6 +174,12 @@ __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ flo
+             asc_sub(inv_scale_bits, inv_scale_bias, bits[0], pair_mask_b32);
+             asc_mul(value[pair_idx], value[pair_idx], reinterpret_cast<vector_float&>(inv_scale_bits), pair_mask_b32);
+ 
++            if constexpr (DG_MOE_CANN_MXFP_QUANT) {
++                // Floor scales can exceed E4M3 finite range; clamp explicitly.
++                asc_min_scalar(value[pair_idx], value[pair_idx], 448.0f, pair_mask_b32);
++                asc_max_scalar(value[pair_idx], value[pair_idx], -448.0f, pair_mask_b32);
++            }
++
+             // Store FP8 and UE8M0 scales
+             vector_fp8_e4m3fn_t value_fp8;
+             asc_float2e4m3_rn_sat(value_fp8, value[pair_idx], pair_mask_b32, ASC_DISPERSE_FIRST_QUARTER);
+@@ -166,7 +199,9 @@ __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ flo
+ }
+ 
+ // Combine: FP32 sum -> BF16; input stride is num_channels
+-__simd_vf__ inline void vf_combine_reduce(__ubuf__ bfloat16_t* inputs, uint32_t num_inputs, uint32_t num_channels) {
++template <bool kApplyRouteWeight>
++__simd_vf__ inline void vf_combine_reduce(__ubuf__ bfloat16_t* inputs, uint32_t num_inputs, uint32_t num_channels,
++                                         __ubuf__ float* route_weights, uint32_t num_routed_inputs) {
+     constexpr uint32_t kNumChannelsPerVector = sizeof(vector_bfloat16_t) / sizeof(bfloat16_t);
+     const auto mask_b16 = asc_create_mask_b16(PAT_ALL);
+     const auto mask_b32 = asc_create_mask_b32(PAT_ALL);
+@@ -179,6 +214,7 @@ __simd_vf__ inline void vf_combine_reduce(__ubuf__ bfloat16_t* inputs, uint32_t
+         asc_duplicate_scalar(sum0, 0.0f);
+         asc_duplicate_scalar(sum1, 0.0f);
+         auto input_ptr = inputs + channel_idx;
++        auto weight_ptr = route_weights;
+         for (uint32_t input_idx = 0; input_idx < num_inputs; ++ input_idx) {
+             vector_bfloat16_t value;
+             vector_float value0, value1;
+@@ -186,6 +222,14 @@ __simd_vf__ inline void vf_combine_reduce(__ubuf__ bfloat16_t* inputs, uint32_t
+ 
+             // Widen BF16 exactly with zero low bits
+             asc_intlv(reinterpret_cast<vector_bfloat16_t&>(value0), reinterpret_cast<vector_bfloat16_t&>(value1), zero_bf16, value);
++            if constexpr (kApplyRouteWeight) {
++                if (input_idx < num_routed_inputs) {
++                    vector_float weight;
++                    asc_loadalign_brc_postupdate(weight, weight_ptr, 8);
++                    asc_mul(value0, value0, weight, mask_b32);
++                    asc_mul(value1, value1, weight, mask_b32);
++                }
++            }
+             asc_add(sum0, sum0, value0, mask_b32);
+             asc_add(sum1, sum1, value1, mask_b32);
+         }
+diff --git a/deep_gemm/mega/__init__.py b/deep_gemm/mega/__init__.py
+index 5597b7f..365cdc6 100644
+--- a/deep_gemm/mega/__init__.py
++++ b/deep_gemm/mega/__init__.py
+@@ -166,7 +166,18 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
+                      recipe: tuple[int, int, int] = (1, 1, 32),
+                      activation: str = 'swiglu',
+                      activation_clamp: float | None = None,
+-                     fast_math: bool = True) -> None:
++                     fast_math: bool = True,
++                     apply_router_weight_on_output: bool = False,
++                     use_cann_mxfp_quant: bool = False) -> None:
++    """Run fused routed MoE with optional post-GMM2 routing weights.
++
++    The default weights SwiGLU before MXFP8 quantization. Set the option to
++    weight BF16 expert outputs in the FP32 combine instead, matching vLLM
++    quantized MoE rounding order. Shared experts are never route-weighted.
++    use_cann_mxfp_quant rounds SwiGLU to BF16, uses the CANN floor-exponent
++    UE8M0 scale, and clips normalized values to the finite E4M3 range.
++    Both compatibility options default to False.
++    """
+     assert sym_buffer.buffer is not None and sym_buffer.handle is not None
+     _C.fp8_fp4_mega_moe(
+         y,
+@@ -180,5 +191,5 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
+         sym_buffer.hidden, sym_buffer.intermediate_hidden, sym_buffer.num_shared_experts,
+         recipe,
+         activation, activation_clamp,
+-        fast_math
++        fast_math, apply_router_weight_on_output, use_cann_mxfp_quant
+     )
